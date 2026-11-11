@@ -17,8 +17,8 @@ import math
 import os
 
 # Coefficients of the utility (see feature_vector); fitted offline.
-BETA = [0.6555, -1.3452, 6.1498, -0.397, -0.4099, 0.0863, 0.7286, 0.0532, -0.406, 0.297, 0.0211,
-        -6.4977, 0.6002, 1.6573]
+BETA = [-0.0948, -0.8319, 8.0059, -0.4529, -0.2704, 0.1477, 0.0988, -0.1008, -0.213, 0.3214, 0.0742,
+        -10.5314, 2.2247, 1.2403]
 PARAMS = {
     'gain_lag': 12.0,    # hours back for the rank-gain feature
     'age_cap': 7.0,      # days; age since first seen is capped here (and set to it for games in the first read)
@@ -219,7 +219,15 @@ def refit(hist, prior):
                     H[a][c] += v
                     if c != a:
                         H[c][a] += v
-        beta = [b + s for b, s in zip(beta, solve(H, g))]
+        step = solve(H, g)
+        big = max(abs(s) for s in step)
+        if not math.isfinite(big):
+            return list(prior)
+        if big > 1.0:   # damp: the refit should stay a correction to the prior
+            step = [s / big for s in step]
+        beta = [b + s for b, s in zip(beta, step)]
+    if not all(math.isfinite(b) for b in beta):
+        return list(prior)
     return beta
 
 
@@ -246,7 +254,7 @@ def forecast(task, reads):
     return games, acc
 
 
-def write(task, games, acc):
+def write(task, games, acc, reads):
     places = len(acc)
     rows = []
     for k in range(places):
@@ -260,10 +268,18 @@ def write(task, games, acc):
             rows.append({'universe_id': games[i], 'place': k + 1, 'p': q / 1e6})
     top, used = [], set()
     for k in range(places):
-        best = max((i for i in range(len(games)) if games[i] not in used), key=lambda i: (acc[k][i], -i))
+        cand = [i for i in range(len(games)) if games[i] not in used]
+        if not cand:
+            break
+        best = max(cand, key=lambda i: (acc[k][i], -i))
         top.append(games[best])
         used.add(games[best])
-    out = {'probabilities': rows, 'top10': top}
+    for r in reversed(reads):   # a chart shorter than 10: fill from earlier charts
+        for g in chart(r):
+            if len(top) < 10 and g not in used:
+                top.append(g)
+                used.add(g)
+    out ={'probabilities': rows, 'top10': top}
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, task.get('output', 'forecast.json')), 'w') as f:
         f.write(json.dumps(out, separators=(',', ':')) + '\n')
@@ -272,7 +288,7 @@ def write(task, games, acc):
 def main():
     task, reads = load()
     games, acc = forecast(task, reads)
-    write(task, games, acc)
+    write(task, games, acc, reads)
 
 
 if __name__ == '__main__':
