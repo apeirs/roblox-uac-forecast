@@ -27,6 +27,10 @@ PARAMS = {
     'refit_lambda': 100.0,  # ridge strength toward BETA for the run-time refit (0 = no refit)
     'refit_pairs': 300,   # read pairs used by the refit at most (evenly thinned)
     'refit_iters': 2,     # Newton steps
+    'refit_halflife': 24.0, # hours; refit pairs weighted by 0.5 ** (age of target read / halflife), 0 = equal
+    'temp': 1.0,         # power on each place's final distribution (1 = none)
+    'mix': 0.0,           # weight of the smooth rank prior mixed into each place
+    'mix_scale': 1.0,     # width of that prior in log-rank
 }
 if os.environ.get('UAC_PARAMS'):
     _p = json.loads(os.environ['UAC_PARAMS'])
@@ -179,20 +183,23 @@ def refit(hist, prior):
         return prior
     origins = {}
     samples = []
+    hl = PARAMS['refit_halflife']
+    t_end = hist.t[-1]
     for i, j, d in pairs:
         if i not in origins:
             orig = hist.origin(i)
             origins[i] = (orig, {o[0]: a for a, o in enumerate(orig)})
         orig, idx = origins[i]
+        wt = 0.5 ** ((t_end - hist.t[j]) / hl) if hl > 0 else 1.0   # recent target reads count more
         for k in range(1, 11):
             X = [feature_vector(o, k, d) for o in orig] + [new_vector(k, d)]
-            samples.append((X, idx.get(hist.charts[j][k - 1], len(orig))))
+            samples.append((X, idx.get(hist.charts[j][k - 1], len(orig)), wt))
     beta = list(prior)
     F = NFEAT
     for _ in range(int(PARAMS['refit_iters'])):
         g = [-lam * (b - p) for b, p in zip(beta, prior)]
         H = [[lam if a == c else 0.0 for c in range(F)] for a in range(F)]
-        for X, ch in samples:
+        for X, ch, wt in samples:
             us = [sum(b * x for b, x in zip(beta, xv)) for xv in X]
             mx = max(us)
             es = [math.exp(u - mx) for u in us]
@@ -213,9 +220,9 @@ def refit(hist, prior):
                         row[c] += xa * xv[c]
             xc = X[ch]
             for a in range(F):
-                g[a] += xc[a] - ex[a]
+                g[a] += wt * (xc[a] - ex[a])
                 for c in range(a, F):
-                    v = exx[a][c] - ex[a] * ex[c]
+                    v = wt * (exx[a][c] - ex[a] * ex[c])
                     H[a][c] += v
                     if c != a:
                         H[c][a] += v
@@ -254,6 +261,30 @@ def forecast(task, reads):
     return games, acc
 
 
+def calibrate(acc):
+    """Per place: power T on the averaged distribution (newcomer share included), then a mixture of weight w
+    with a smooth prior over chart rank, exp(-|log r - log k| / s), that keeps the place's newcomer share."""
+    T, w, s = PARAMS['temp'], PARAMS['mix'], PARAMS['mix_scale']
+    if T == 1.0 and w == 0.0:
+        return acc
+    out = []
+    for k, row in enumerate(acc):
+        new = max(1e-9, 1.0 - sum(row))
+        if T != 1.0:
+            powered = [x ** T for x in row]
+            pn = new ** T
+            z = sum(powered) + pn
+            row = [x / z for x in powered]
+            new = pn / z
+        if w > 0.0:
+            lk = math.log(k + 1)
+            prior = [math.exp(-abs(math.log(i + 1) - lk) / s) for i in range(len(row))]
+            zp = sum(prior)
+            row = [(1 - w) * x + w * (1 - new) * p / zp for x, p in zip(row, prior)]
+        out.append(row)
+    return out
+
+
 def write(task, games, acc, reads):
     places = len(acc)
     rows = []
@@ -288,6 +319,7 @@ def write(task, games, acc, reads):
 def main():
     task, reads = load()
     games, acc = forecast(task, reads)
+    acc = calibrate(acc)
     write(task, games, acc, reads)
 
 
