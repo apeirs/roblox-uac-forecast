@@ -28,7 +28,10 @@ PARAMS = {
     'refit_pairs': 300,   # read pairs used by the refit at most (evenly thinned)
     'refit_iters': 2,     # Newton steps
     'refit_halflife': 24.0, # hours; refit pairs weighted by 0.5 ** (age of target read / halflife), 0 = equal
-    'temp': 1.0,         # power on each place's final distribution (1 = none)
+    'new_b': 0.0,         # newcomer utility correction: + new_b + new_a * h (+ new_a1 * h at place 1)
+    'new_a': 0.0,
+    'new_a1': 1.5,
+    'temp': 1.0,        # power on each place's final distribution (1 = none)
     'mix': 0.0,           # weight of the smooth rank prior mixed into each place
     'mix_scale': 1.0,     # width of that prior in log-rank
 }
@@ -129,10 +132,15 @@ def new_vector(k, d):
     return (0.0,) * 11 + (1.0, math.log(1.0 + d), math.log(k))
 
 
-def probs(orig, k, d, beta):
-    """Softmax over the origin games and the newcomer option: (list of p per game, p_new)."""
+def probs(orig, k, d, beta, correct=True):
+    """Softmax over the origin games and the newcomer option: (list of p per game, p_new).
+    `correct` adds the horizon correction to the newcomer utility: the fitted rate lags the chart because only
+    pairs ending 2-3 days before the history ends teach the long-horizon newcomer rate."""
     us = [sum(b * x for b, x in zip(beta, feature_vector(o, k, d))) for o in orig]
     un = sum(b * x for b, x in zip(beta, new_vector(k, d)))
+    if correct:
+        h = d / PARAMS['h_scale']
+        un += PARAMS['new_b'] + PARAMS['new_a'] * h + (PARAMS['new_a1'] * h if k == 1 else 0.0)
     m = max(max(us), un)
     es = [math.exp(u - m) for u in us]
     en = math.exp(un - m)
