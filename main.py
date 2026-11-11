@@ -3,51 +3,48 @@
 Reads history.ndjson and task.json from $MAKEFUN_INPUT_DIR (else /input) and writes forecast.json to
 $MAKEFUN_OUTPUT_DIR (else /output). Python 3.13, standard library only, deterministic.
 
-Model: each game on the last chart has a future log-rank drawn from a Laplace distribution centred on its current
-log-rank (shifted by its recent log-rank trend) whose width grows with the horizon and the game's volatility. A
-place's distribution at one horizon is the probability mass each game puts on that place, normalised over games,
-after reserving a share for games not on the last chart (newcomers), which grows with the horizon. The forecast
-is the average of those distributions over the 72 hourly slots of the window.
+Model: a conditional logit. For a place k at a horizon of d hours after the last read, the game there is one of the
+games on the last chart, or a game not on it ("newcomer"). Each game's utility combines its log-rank distance to
+k (a kernel that widens with d), its recent rank gain, how long it has been on the chart, and its player count
+against the chart's median, each with a horizon interaction; the newcomer option has a utility that grows with d
+and with k. The coefficients were fitted by maximum likelihood on pairs of archive reads 1 to 80 hours apart.
+A place's forecast is the average of the softmax over the window's hourly slots; the newcomer share is left
+unnamed, so the scorer spreads it over games that join the chart.
 """
 import datetime as dt
 import json
 import math
 import os
 
+# Coefficients of the utility (see feature_vector); fitted offline.
+BETA = [0.6555, -1.3452, 6.1498, -0.397, -0.4099, 0.0863, 0.7286, 0.0532, -0.406, 0.297, 0.0211,
+        -6.4977, 0.6002, 1.6573]
 PARAMS = {
-    's0': 0.25,       # Laplace scale of log-rank at horizon 0
-    's1': 0.12,       # scale growth per sqrt(hour)
-    'mom': 0.5,       # weight on recent log-rank slope (per hour) as drift
-    'mom_cap': 24.0,  # hours of drift at most
-    'eps': 0.03,      # broad component: share spread evenly over places
-    'nu_max': 0.6,    # newcomer share ceiling
-    'nu_tau': 90.0,   # newcomer share time scale (hours)
-    'nu_pow': 2.0,    # newcomer share shape
-    'nu_place': 0.08,  # extra newcomer share per place below 1 (relative)
+    'gain_lag': 12.0,    # hours back for the rank-gain feature
+    'age_cap': 7.0,      # days; age since first seen is capped here (and set to it for games in the first read)
+    'shrink': 0.0,       # mix with uniform-over-chart, per place
+    'h_scale': 72.0,     # hours that make h = 1
 }
 if os.environ.get('UAC_PARAMS'):
-    PARAMS.update(json.loads(os.environ['UAC_PARAMS']))
+    _p = json.loads(os.environ['UAC_PARAMS'])
+    BETA = _p.pop('beta', BETA)
+    PARAMS.update(_p)
 
 IN_DIR = os.environ.get('MAKEFUN_INPUT_DIR') or '/input'
 OUT_DIR = os.environ.get('MAKEFUN_OUTPUT_DIR') or '/output'
+NFEAT = 14
 
 
 def ts(s):
     return dt.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp() / 3600.0
 
 
-def lap_cdf(x, mu, b):
-    z = (x - mu) / b
-    if z < 0:
-        return 0.5 * math.exp(z)
-    return 1.0 - 0.5 * math.exp(-z)
-
-
-def load():
-    with open(os.path.join(IN_DIR, 'task.json')) as f:
+def load(in_dir=None):
+    in_dir = in_dir or IN_DIR
+    with open(os.path.join(in_dir, 'task.json')) as f:
         task = json.load(f)
     reads = []
-    with open(os.path.join(IN_DIR, 'history.ndjson')) as f:
+    with open(os.path.join(in_dir, 'history.ndjson')) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -64,60 +61,97 @@ def chart(read):
     return [r['universe_id'] for r in sorted(read['up_and_coming'], key=lambda r: r['rank'])]
 
 
-def slopes(reads, t_last, span=24.0):
-    """Least-squares slope of log-rank per hour over the reads in the last `span` hours, per game."""
-    pts = {}
-    for r in reads:
-        t = ts(r['at'])
-        if t < t_last - span:
-            continue
-        for i, g in enumerate(chart(r)):
-            pts.setdefault(g, []).append((t - t_last, math.log(i + 1)))
-    out = {}
-    for g in sorted(pts):
-        p = pts[g]
-        if len(p) < 2:
-            continue
-        mt = sum(x for x, _ in p) / len(p)
-        my = sum(y for _, y in p) / len(p)
-        sxx = sum((x - mt) ** 2 for x, _ in p)
-        if sxx <= 1e-9:
-            continue
-        out[g] = sum((x - mt) * (y - my) for x, y in p) / sxx
-    return out
+class History:
+    """Charts, times and per-game first sighting, with origin features for any read."""
+
+    def __init__(self, reads):
+        self.t = [ts(r['at']) for r in reads]
+        self.charts = [chart(r) for r in reads]
+        self.playing = [{x['universe_id']: (x.get('playing') or 0) for x in r['up_and_coming']} for r in reads]
+        self.first = {}
+        for i, c in enumerate(self.charts):
+            for g in c:
+                self.first.setdefault(g, self.t[i])
+
+    def origin(self, i):
+        """Per-game raw features at read i: list of (game, logrank, gain, age_days, plmed)."""
+        t_i = self.t[i]
+        c = self.charts[i]
+        lag = PARAMS['gain_lag']
+        prev = None
+        best = None
+        for j in range(i - 1, -1, -1):
+            dtj = t_i - self.t[j]
+            if dtj < lag * 0.5:
+                continue
+            if dtj > lag * 2.5:
+                break
+            if best is None or abs(dtj - lag) < best:
+                best, prev = abs(dtj - lag), j
+        prank = {}
+        if prev is not None:
+            prank = {g: k + 1 for k, g in enumerate(self.charts[prev])}
+            absent = len(self.charts[prev]) + 10
+        pl = sorted(self.playing[i].values())
+        med = pl[len(pl) // 2] if pl else 0
+        cap = PARAMS['age_cap']
+        out = []
+        for k, g in enumerate(c):
+            lr = math.log(k + 1)
+            gain = (math.log(prank.get(g, absent)) - lr) if prev is not None else 0.0
+            if self.first[g] <= self.t[0]:
+                age = cap
+            else:
+                age = min(cap, (t_i - self.first[g]) / 24.0)
+            plm = max(-3.0, min(3.0, math.log((1 + self.playing[i].get(g, 0)) / (1 + med))))
+            out.append((g, lr, gain, age, plm))
+        return out
+
+
+def feature_vector(o, k, d):
+    """Features of origin game o = (g, logrank, gain, age, plmed) for place k at horizon d hours."""
+    h = d / PARAMS['h_scale']
+    lk = math.log(k)
+    dist = o[1] - lk
+    ad = abs(dist)
+    return (-ad, -ad * h, -ad / (1.0 + d) ** 0.5, dist, dist * h, o[2], o[2] * h, o[3], o[3] * h, o[4], o[4] * h,
+            0.0, 0.0, 0.0)
+
+
+def new_vector(k, d):
+    return (0.0,) * 11 + (1.0, math.log(1.0 + d), math.log(k))
+
+
+def probs(orig, k, d, beta):
+    """Softmax over the origin games and the newcomer option: (list of p per game, p_new)."""
+    us = [sum(b * x for b, x in zip(beta, feature_vector(o, k, d))) for o in orig]
+    un = sum(b * x for b, x in zip(beta, new_vector(k, d)))
+    m = max(max(us), un)
+    es = [math.exp(u - m) for u in us]
+    en = math.exp(un - m)
+    z = sum(es) + en
+    return [e / z for e in es], en / z
 
 
 def forecast(task, reads):
-    P = PARAMS
     places = int(task.get('places', 10))
     w = task['window']
     t0 = ts(w['from'])
     nslots = int(w.get('slots', 72))
     slot_h = float(w.get('slot_minutes', 60)) / 60.0
-    last = reads[-1]
-    t_last = ts(last['at'])
-    games = chart(last)
+    hist = History(reads)
+    i = len(reads) - 1
+    orig = hist.origin(i)
+    games = [o[0] for o in orig]
     n = len(games)
-    slope = slopes(reads, t_last)
-    edges = [math.log(k + 0.5) for k in range(1, places + 1)]
     acc = [[0.0] * n for _ in range(places)]
+    sh = PARAMS['shrink']
     for s in range(nslots):
-        d = max(0.0, t0 + (s + 0.5) * slot_h - t_last)
-        scale = P['s0'] + P['s1'] * math.sqrt(d)
-        nu_base = P['nu_max'] * (1.0 - math.exp(-((d / P['nu_tau']) ** P['nu_pow'])))
-        mass = [[0.0] * n for _ in range(places)]
-        for i, g in enumerate(games):
-            mu = math.log(i + 1) + P['mom'] * slope.get(g, 0.0) * min(d, P['mom_cap'])
-            prev = 0.0
-            for k in range(places):
-                c = lap_cdf(edges[k], mu, scale)
-                mass[k][i] = (1 - P['eps']) * (c - prev) + P['eps'] / n
-                prev = c
+        d = max(0.5, t0 + (s + 0.5) * slot_h - hist.t[i])
         for k in range(places):
-            tot = sum(mass[k])
-            nu = min(0.95, nu_base * (1.0 + P['nu_place'] * k))
-            for i in range(n):
-                acc[k][i] += (1.0 - nu) * mass[k][i] / tot / nslots
+            p, pn = probs(orig, k + 1, d, BETA)
+            for j in range(n):
+                acc[k][j] += ((1 - sh) * p[j] + sh * (1 - pn) / n) / nslots
     return games, acc
 
 
@@ -133,7 +167,6 @@ def write(task, games, acc):
                 continue
             total += q
             rows.append({'universe_id': games[i], 'place': k + 1, 'p': q / 1e6})
-    # top 10: assign places greedily by probability, best first
     top, used = [], set()
     for k in range(places):
         best = max((i for i in range(len(games)) if games[i] not in used), key=lambda i: (acc[k][i], -i))
