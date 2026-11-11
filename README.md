@@ -8,7 +8,9 @@ the game's log-rank distance to the place (a kernel that widens with the horizon
 12 hours, how long it has been on the chart, and its player count against the chart's median. A "newcomer"
 option, whose share grows with the horizon and the place, stands for games not on the last chart. The
 coefficients come from a maximum-likelihood fit on pairs of archive reads 1 to 80 hours apart, and are refitted
-at run time on the input history's own read pairs (ridge toward the stored fit). The forecast for a place is the
+at run time on the input history's own read pairs (ridge toward the stored fit, recent pairs weighted more
+with a 24-hour half-life). The newcomer share at place 1 is raised with the horizon, since brand-new games
+take #1 more often than the fitted rate says. The forecast for a place is the
 softmax averaged over the window's hours. Every chart game gets a row, and the newcomer share is left unnamed,
 so the scorer spreads it over games that join the chart.
 
