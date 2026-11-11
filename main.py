@@ -24,6 +24,9 @@ PARAMS = {
     'age_cap': 7.0,      # days; age since first seen is capped here (and set to it for games in the first read)
     'shrink': 0.0,       # mix with uniform-over-chart, per place
     'h_scale': 72.0,     # hours that make h = 1
+    'refit_lambda': 100.0,  # ridge strength toward BETA for the run-time refit (0 = no refit)
+    'refit_pairs': 300,   # read pairs used by the refit at most (evenly thinned)
+    'refit_iters': 2,     # Newton steps
 }
 if os.environ.get('UAC_PARAMS'):
     _p = json.loads(os.environ['UAC_PARAMS'])
@@ -133,6 +136,93 @@ def probs(orig, k, d, beta):
     return [e / z for e in es], en / z
 
 
+def solve(A, b):
+    """Gaussian elimination with partial pivoting: x with A x = b."""
+    n = len(b)
+    M = [A[r][:] + [b[r]] for r in range(n)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(M[r][c]))
+        M[c], M[p] = M[p], M[c]
+        if M[c][c] == 0.0:
+            continue
+        for r in range(n):
+            if r != c:
+                f = M[r][c] / M[c][c]
+                if f != 0.0:
+                    for cc in range(c, n + 1):
+                        M[r][cc] -= f * M[c][cc]
+    return [M[r][n] / M[r][r] if M[r][r] != 0.0 else 0.0 for r in range(n)]
+
+
+def refit(hist, prior):
+    """Newton steps on the history's own read pairs (1 to 80 h apart), with a ridge centred on the prior."""
+    lam = PARAMS['refit_lambda']
+    pairs = []
+    for i in range(len(hist.t)):
+        for j in range(i + 1, len(hist.t)):
+            d = hist.t[j] - hist.t[i]
+            if 1.0 <= d <= 80.0:
+                pairs.append((i, j, d))
+    # thin evenly within 8-hour lag bins, so hourly reads' many short-lag pairs don't swamp the long lags
+    cap = int(PARAMS['refit_pairs']) // 10
+    bins = {}
+    for p in pairs:
+        bins.setdefault(min(9, int(p[2] // 8)), []).append(p)
+    pairs = []
+    for b in sorted(bins):
+        ps = bins[b]
+        if len(ps) > cap:
+            step = len(ps) / cap
+            ps = [ps[int(a * step)] for a in range(cap)]
+        pairs.extend(ps)
+    if not pairs:
+        return prior
+    origins = {}
+    samples = []
+    for i, j, d in pairs:
+        if i not in origins:
+            orig = hist.origin(i)
+            origins[i] = (orig, {o[0]: a for a, o in enumerate(orig)})
+        orig, idx = origins[i]
+        for k in range(1, 11):
+            X = [feature_vector(o, k, d) for o in orig] + [new_vector(k, d)]
+            samples.append((X, idx.get(hist.charts[j][k - 1], len(orig))))
+    beta = list(prior)
+    F = NFEAT
+    for _ in range(int(PARAMS['refit_iters'])):
+        g = [-lam * (b - p) for b, p in zip(beta, prior)]
+        H = [[lam if a == c else 0.0 for c in range(F)] for a in range(F)]
+        for X, ch in samples:
+            us = [sum(b * x for b, x in zip(beta, xv)) for xv in X]
+            mx = max(us)
+            es = [math.exp(u - mx) for u in us]
+            z = sum(es)
+            ex = [0.0] * F
+            exx = [[0.0] * F for _ in range(F)]
+            for e, xv in zip(es, X):
+                p = e / z
+                if p < 1e-9:
+                    continue
+                for a in range(F):
+                    xa = xv[a] * p
+                    if xa == 0.0:
+                        continue
+                    ex[a] += xa
+                    row = exx[a]
+                    for c in range(a, F):
+                        row[c] += xa * xv[c]
+            xc = X[ch]
+            for a in range(F):
+                g[a] += xc[a] - ex[a]
+                for c in range(a, F):
+                    v = exx[a][c] - ex[a] * ex[c]
+                    H[a][c] += v
+                    if c != a:
+                        H[c][a] += v
+        beta = [b + s for b, s in zip(beta, solve(H, g))]
+    return beta
+
+
 def forecast(task, reads):
     places = int(task.get('places', 10))
     w = task['window']
@@ -140,6 +230,7 @@ def forecast(task, reads):
     nslots = int(w.get('slots', 72))
     slot_h = float(w.get('slot_minutes', 60)) / 60.0
     hist = History(reads)
+    beta = refit(hist, BETA) if PARAMS['refit_lambda'] > 0 else BETA
     i = len(reads) - 1
     orig = hist.origin(i)
     games = [o[0] for o in orig]
@@ -149,7 +240,7 @@ def forecast(task, reads):
     for s in range(nslots):
         d = max(0.5, t0 + (s + 0.5) * slot_h - hist.t[i])
         for k in range(places):
-            p, pn = probs(orig, k + 1, d, BETA)
+            p, pn = probs(orig, k + 1, d, beta)
             for j in range(n):
                 acc[k][j] += ((1 - sh) * p[j] + sh * (1 - pn) / n) / nslots
     return games, acc
