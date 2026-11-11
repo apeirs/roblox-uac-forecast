@@ -31,7 +31,8 @@ PARAMS = {
     'new_b': 0.0,         # newcomer utility correction: + new_b + new_a * h (+ new_a1 * h at place 1)
     'new_a': 0.0,
     'new_a1': 1.5,
-    'temp': 1.0,        # power on each place's final distribution (1 = none)
+    'name_min': 0.004,     # rows below this probability are not written (their mass joins the unnamed share)
+    'temp': 1.0,       # power on each place's final distribution (1 = none)
     'mix': 0.0,           # weight of the smooth rank prior mixed into each place
     'mix_scale': 1.0,     # width of that prior in log-rank
 }
@@ -301,7 +302,7 @@ def write(task, games, acc, reads):
         total = 0
         for i in order:
             q = int(acc[k][i] * 1e6)   # floor to 6 decimals
-            if q < 1 or total + q > 999990:
+            if q < max(1, int(PARAMS['name_min'] * 1e6)) or total + q > 999990:   # below: left to the shared rest
                 continue
             total += q
             rows.append({'universe_id': games[i], 'place': k + 1, 'p': q / 1e6})
